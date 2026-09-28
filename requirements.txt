@@ -1,0 +1,5 @@
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+simple-lama-inpainting==0.1.0
+mcp>=1.2
