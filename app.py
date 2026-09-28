@@ -22,6 +22,7 @@ HTTP API
        body: raw image bytes (Content-Type image/*) or multipart field `file`
        query: profile=avito (default) | profile=auto | mask_box=x0,y0,x1,y1
               mask=logo|rect (profile silhouette or its whole block)
+              force=1 (clean the profile mask even when the detector says absent)
               quality=1..100 (default 95), method=auto|lama|unblend (auto = lama)
        auth: Authorization: Bearer <CLEANER_TOKEN>; required unless CLEANER_ALLOW_ANON=1
        reply headers: X-Mask-Box, X-Watermark-Before, X-Watermark-After, X-Method
@@ -126,8 +127,8 @@ class Profile:
         """Bounding box (x0, y0, x1, y1) of the watermark block on an image."""
         k = self.scale(image_w)
         w, h = self.block_size(image_w)
-        x1 = image_w - round(self.right * k + self.right_ratio * image_w)
-        y1 = image_h - round(self.bottom * k + self.bottom_ratio * image_h)
+        x1 = min(image_w, image_w - round(self.right * k + self.right_ratio * image_w))
+        y1 = min(image_h, image_h - round(self.bottom * k + self.bottom_ratio * image_h))
         return (max(0, x1 - w), max(0, y1 - h), x1, y1)
 
     @classmethod
@@ -553,6 +554,7 @@ def build_app():
         mask: str = Query(default="logo", pattern="^(logo|rect)$"),
         quality: int = Query(default=95, ge=1, le=100),
         method: str = Query(default="auto", pattern="^(auto|lama|unblend)$"),
+        force: bool = Query(default=False),
         authorization: Optional[str] = Header(default=None),
     ):
         check_auth(authorization)
@@ -599,12 +601,12 @@ def build_app():
                 raise HTTPException(status_code=400, detail=str(error)) from error
             before = presence_score(image, chosen)
             box = ",".join(str(v) for v in chosen.box(image.width, image.height))
-            if mask == "logo" and before is not None and before < chosen.found:
+            if mask == "logo" and not force and before is not None and before < chosen.found:
                 return Response(status_code=204, headers={"X-Mask-Box": box, "X-Watermark-Before": fmt(before), "X-Method": "none"})
             cleaned, used = cleaner.clean(image, mask, method, chosen)
             after = presence_score(cleaned, chosen)
             headers = {"X-Mask-Box": box, "X-Watermark-Before": fmt(before), "X-Watermark-After": fmt(after), "X-Method": used}
-            if mask == "logo" and after is not None and after > chosen.clean:
+            if mask == "logo" and not force and after is not None and after > chosen.clean:
                 raise HTTPException(status_code=422, detail=f"watermark still detectable after cleaning (score {after:.0f}, was {fmt(before)})", headers=headers)
         out = io.BytesIO()
         cleaned.save(out, format="JPEG", quality=quality, subsampling=0)

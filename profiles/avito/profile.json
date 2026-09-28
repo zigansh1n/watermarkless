@@ -1,6 +1,14 @@
 {
   "name": "avito",
-  "block": {"width": 103, "height": 37, "right": 6, "bottom": 5},
-  "thresholds": {"present": 400, "clean": 250},
-  "notes": "Avito listing logo, bottom-right. Block measured on 1280x854, 1280x960, 720x960 and 640x480; glyphs 94x24 at (3,4) from the official logo alpha fitted to 208 photos. Detector: matched filter on 202 photos from 9 listings."
+  "block": {
+    "width": 103,
+    "height": 37,
+    "right": 6,
+    "bottom": 5
+  },
+  "thresholds": {
+    "present": 260,
+    "clean": 250
+  },
+  "notes": "Avito listing logo, bottom-right. Block measured on 1280x854, 1280x960, 720x960 and 640x480; glyphs 94x24 at (3,4) from the official logo alpha fitted to 208 photos. Detector: matched filter on 202 photos from 9 listings. Present threshold 260: on 240 sample photos the logo scores 300..2600 and clean corners at most 203; a field run on 3131 photos saw logos on white walls at 292..335, below the earlier 400."
 }

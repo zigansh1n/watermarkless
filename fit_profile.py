@@ -124,10 +124,11 @@ def main(argv):
         return 1
 
     width, height, right, bottom, use_scaled, right_ratio, bottom_ratio = locate(photos, given)
-    width += 2 * BLOCK_MARGIN
-    height += 2 * BLOCK_MARGIN
-    right = right - BLOCK_MARGIN
-    bottom = bottom - BLOCK_MARGIN
+    # Grow the block by the margin on every side, but never past the edge.
+    width += BLOCK_MARGIN + min(BLOCK_MARGIN, max(0, right))
+    height += BLOCK_MARGIN + min(BLOCK_MARGIN, max(0, bottom))
+    right = max(0, right - BLOCK_MARGIN)
+    bottom = max(0, bottom - BLOCK_MARGIN)
     profile = app.Profile(name=name, width=width, height=height, right=right, bottom=bottom, directory=app.PROFILES_DIR / name, found=400.0, clean=250.0, notes=f"fitted from {len(photos)} photos", scaled=use_scaled, ref_width=REF_WIDTH, right_ratio=round(right_ratio, 4), bottom_ratio=round(bottom_ratio, 4))
     print(f"block {width}x{height}, right {right} + {right_ratio:.3f}W, bottom {bottom} + {bottom_ratio:.3f}H{' (scaled)' if use_scaled else ''}")
 
@@ -173,22 +174,14 @@ def main(argv):
         (tpos if test else pos).append(hp)
         (tneg if test else neg).append(hn)
     n = len(pos[0])
-    # Per-photo contrast normalisation, then diagonal LDA: pixels that vary
-    # between photos (a per-listing ID string, scene texture) get a small
-    # weight, the constant part of the mark a large one.
-    pos = [app.normalized(v) for v in pos]
-    neg = [app.normalized(v) for v in neg]
-    tpos = [app.normalized(v) for v in tpos]
-    tneg = [app.normalized(v) for v in tneg]
-    mp = [sum(v[i] for v in pos) / len(pos) for i in range(n)]
-    mn = [sum(v[i] for v in neg) / len(neg) for i in range(n)]
-    vp = [sum((v[i] - mp[i]) ** 2 for v in pos) / len(pos) for i in range(n)]
-    vn = [sum((v[i] - mn[i]) ** 2 for v in neg) / len(neg) for i in range(n)]
-    eps = 0.05 * (sum(vp) + sum(vn)) / n
-    w = [(mp[i] - mn[i]) / (vp[i] + vn[i] + eps) for i in range(n)]
+    # Matched filter: mean high-passed block of positives minus negatives.
+    # A diagonal-LDA variant with per-photo normalisation was tried and
+    # separated worse on the Avito sample (logo min -1899 vs clean max 0,
+    # against 300 vs 203 for this one), so the plain difference stays.
+    w = [sum(v[i] for v in pos) / len(pos) - sum(v[i] for v in neg) / len(neg) for i in range(n)]
     norm = sum(x * x for x in w) ** 0.5
     w = [x / norm for x in w]
-    score = lambda hp: sum(a * b for a, b in zip(hp, w)) * 100  # noqa: E731
+    score = lambda hp: sum(a * b for a, b in zip(hp, w))  # noqa: E731
     p_scores = summary("logo", [score(h) for h in pos + tpos])
     n_scores = summary("clean", [score(h) for h in neg + tneg])
     gap_low, gap_high = n_scores[-1], p_scores[len(p_scores) // 20]
@@ -209,7 +202,7 @@ def main(argv):
     img = Image.new("L", (width + 2 * app.DETECTOR_PAD, height + 2 * app.DETECTOR_PAD))
     img.putdata([int(round(128 + 127 * x / scale)) for x in w])
     img.save(profile.detector)
-    profile.detector_meta.write_text(json.dumps({"pad": app.DETECTOR_PAD, "scale": scale, "normalize": True, "gain": 100}))
+    profile.detector_meta.write_text(json.dumps({"pad": app.DETECTOR_PAD, "scale": scale}))
     profile = app.Profile(**{**profile.__dict__, "found": float(found), "clean": float(clean)})
     profile.save()
     print(f"thresholds: present >= {found}, clean <= {clean}")

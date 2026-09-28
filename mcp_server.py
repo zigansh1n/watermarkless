@@ -48,7 +48,7 @@ def _default_output(source: Path) -> Path:
     return source.parent / "clean" / (source.stem + ".jpg")
 
 
-def _clean_one(source: Path, output: Optional[Path], method: str, quality: int, profile: str = "avito", mask_box: Optional[list] = None) -> dict:
+def _clean_one(source: Path, output: Optional[Path], method: str, quality: int, profile: str = "avito", mask_box: Optional[list] = None, force: bool = False) -> dict:
     image = _open(str(source))
     started = time.time()
     if mask_box is not None:
@@ -69,11 +69,11 @@ def _clean_one(source: Path, output: Optional[Path], method: str, quality: int, 
         return {"path": str(source), "status": "cleaned", "profile": app.AUTO, "output": str(target), "method": "auto+lama", "boxes": [list(b) for b in boxes], "ms": round((time.time() - started) * 1000)}
     chosen = app.profile_named(profile)
     before = app.presence_score(image, chosen)
-    if before is not None and before < chosen.found:
+    if not force and before is not None and before < chosen.found:
         return {"path": str(source), "status": "no_watermark", "profile": chosen.name, "score": round(before)}
     cleaned, used = app.cleaner.clean(image, "logo", method, chosen)
     after = app.presence_score(cleaned, chosen)
-    if after is not None and after > chosen.clean:
+    if not force and after is not None and after > chosen.clean:
         return {"path": str(source), "status": "still_present", "profile": chosen.name, "scoreBefore": round(before or 0), "scoreAfter": round(after), "method": used}
     target = output or _default_output(source)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -143,15 +143,16 @@ def clean_photo(
     quality: int = 95,
     profile: str = "avito",
     mask_box: Optional[list] = None,
+    force: bool = False,
 ) -> dict:
-    """Remove a watermark from one photo. Writes <dir>/clean/<name>.jpg unless output_path is given. profile: a known mark (avito) with its mask and detector, or 'auto' to find marks of any site with the generic detector; mask_box=[x0,y0,x1,y1] in pixels inpaints exactly that area without a check. method: lama (default) or unblend (experimental, avito only)."""
+    """Remove a watermark from one photo. Writes <dir>/clean/<name>.jpg unless output_path is given. profile: a known mark (avito) with its mask and detector, or 'auto' to find marks of any site with the generic detector; mask_box=[x0,y0,x1,y1] in pixels inpaints exactly that area without a check. force=true cleans the profile's mask even when the presence detector says the mark is absent (use for marks on plain white backgrounds that score low). method: lama (default) or unblend (experimental, avito only)."""
     if method not in ("lama", "unblend"):
         raise ValueError("method must be lama or unblend")
     if not 1 <= quality <= 100:
         raise ValueError("quality must be 1..100")
     source = Path(path).expanduser()
     try:
-        return _clean_one(source, Path(output_path).expanduser() if output_path else None, method, quality, profile, mask_box)
+        return _clean_one(source, Path(output_path).expanduser() if output_path else None, method, quality, profile, mask_box, force)
     except ValueError as error:
         return {"path": path, "status": "error", "error": str(error)}
 
@@ -164,6 +165,7 @@ def clean_folder(
     skip_existing: bool = True,
     profile: str = "avito",
     mask_box: Optional[list] = None,
+    force: bool = False,
 ) -> dict:
     """Remove a watermark from every photo in a folder (not recursive; a `clean` subfolder is ignored), by profile ('auto' for any site) or by a shared mask_box. Returns per-file results."""
     if method not in ("lama", "unblend"):
@@ -182,7 +184,7 @@ def clean_folder(
             results.append({"path": str(source), "status": "skipped", "output": str(target)})
             continue
         try:
-            results.append(_clean_one(source, None, method, quality, profile, mask_box))
+            results.append(_clean_one(source, None, method, quality, profile, mask_box, force))
         except Exception as error:  # noqa: BLE001 - one bad file must not stop the folder
             results.append({"path": str(source), "status": "error", "error": str(error)})
     counts = {}

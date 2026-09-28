@@ -49,12 +49,12 @@ Tools:
 - `list_profiles()` — known watermarks with block geometry and thresholds, and whether `auto` is available.
 - `find_watermarks(path, confidence=0.25)` — generic detector boxes for any site.
 - `detect_watermark(path, profile="avito")` — presence score of one photo
-  (avito: present ≥ 400, clean ≤ 250).
+  (avito: present ≥ 260, clean ≤ 250).
 - `clean_photo(path, output_path?, method="lama"|"unblend", quality=95,
   profile="avito", mask_box?)` — cleans one file into `<dir>/clean/<name>.jpg`
   unless `output_path` is given; answers `no_watermark` / `still_present`
-  instead of writing when the detector says so. `profile="auto"` finds marks of
-  any site with the generic detector. With `mask_box=[x0,y0,x1,y1]` (image
+  instead of writing when the detector says so; `force=true` cleans anyway.
+  `profile="auto"` finds marks of any site with the generic detector. With `mask_box=[x0,y0,x1,y1]` (image
   pixels) exactly that area is inpainted, no check.
 - `clean_folder(directory, method, quality, skip_existing=true, profile, mask_box?)`
   — every image in a folder, not recursive, `clean/` ignored; per-file statuses.
@@ -137,9 +137,11 @@ mean high-passed corner of watermarked photos minus that of their LaMa-cleaned
 versions. `presence_score` is the dot product of a photo's high-passed corner
 with it. Measured on 202 photos from 9 listings plus 17 held-out photos:
 logo 300..2600 (median ~1500), cleaned corners and logo-free scene crops
--320..210. Below `PRESENCE_FOUND` (400) the service answers 204 and the
-client keeps the original; above `PRESENCE_CLEAN` (250) after cleaning it
-answers 422. So if Avito moves or resizes the logo, downloads keep working
+-320..210. Below the profile's `present` threshold (avito: 260; a field
+run on 3131 photos found logos on white walls scoring 292..335, so the
+first value of 400 was too high) the service answers 204 and the client keeps
+the original; above `clean` (250) after cleaning it answers 422. `force=1`
+(HTTP) or `force=true` (MCP) cleans the profile mask regardless. So if Avito moves or resizes the logo, downloads keep working
 and report "not found" instead of damaging corners. A plain brightness test
 was tried first and rejected: it missed 26 of 202 logos on bright walls. The
 community YOLOv8n-seg from platonator777/Avito_watermarks (trained on
@@ -164,7 +166,9 @@ context goes through LaMa and only the masked pixels are written back. If Avito
 moves or resizes the logo, re-measure and update the constants at the top of
 `app.py`; `python test_mask.py` checks the geometry without loading the model.
 
-Cost per photo on an Apple M3 Max, CPU only: about 0.3 s and a 1.6 GB resident
+Use the server or the MCP tools for batches: the model loads once. Running
+`app.py clean` per photo reloads it every time and costs about a second
+extra per photo. Cost per photo on an Apple M3 Max, CPU only: about 0.3 s and a 1.6 GB resident
 process (model 196 MB on disk, weights loaded once). In the container the
 image defaults to `OMP_NUM_THREADS=4`: with one torch thread per core the
 small inpainting window thrashed (11 s per photo on a 14-core VM, 1–3 s with
