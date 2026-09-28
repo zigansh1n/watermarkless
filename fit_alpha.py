@@ -5,8 +5,8 @@
 For every photo the background under the logo is approximated by LaMa
 inpainting of the logo window; then, per pixel and per channel, a straight
 line obs = k*bg + b is fitted across all photos. k is 1-alpha and b is
-alpha*colour of the overlay. Writes logo_k.png and logo_b.png next to app.py
-and prints the fit quality. Photos whose corner does not look like it carries
+alpha*colour of the overlay. Writes k.png and b.png into the profile directory
+(profiles/avito by default) and prints the fit quality. Photos whose corner does not look like it carries
 the logo are skipped, so a directory may hold clean pictures too.
 """
 
@@ -81,12 +81,12 @@ def main(argv):
     k_img.putdata(k_px)
     b_img = Image.new("RGB", (box_w, box_h))
     b_img.putdata(b_px)
-    k_img.save(app.K_PATH)
-    b_img.save(app.B_PATH)
+    k_img.save(app.AVITO.k_map)
+    b_img.save(app.AVITO.b_map)
     alphas = [1 - min(px) / 255 for px in k_px]
     print(f"alpha max {max(alphas):.2f}, logo pixels (alpha>0.05): {sum(1 for a in alphas if a > 0.05)} of {len(alphas)}")
     print(f"mean fit residual: {sum(residuals) / len(residuals):.2f} levels")
-    print(f"wrote {app.K_PATH.name} and {app.B_PATH.name}")
+    print(f"wrote {app.AVITO.k_map} and {app.AVITO.b_map}")
     return 0
 
 

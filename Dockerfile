@@ -6,8 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py mcp_server.py fit_alpha.py fit_detector.py test_mask.py logo_mask_1280.png logo_k.png logo_b.png logo_detector.png logo_detector.json ./
+COPY app.py mcp_server.py fit_alpha.py fit_profile.py test_mask.py ./
+COPY profiles ./profiles
 RUN python test_mask.py
+# Generic watermark detector (MIT), pinned by hash inside ensure_yolo_weights.
+RUN python -c "import app; app.ensure_yolo_weights()"
 # Pull the LaMa weights at build time so the first request does not download,
 # and pin them: the file comes from a GitHub release without a checksum.
 RUN python -c "from simple_lama_inpainting.utils import download_model; from simple_lama_inpainting.models.model import LAMA_MODEL_URL; print(download_model(LAMA_MODEL_URL))" \

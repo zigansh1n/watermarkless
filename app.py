@@ -1,44 +1,45 @@
 """watermarkless: removes watermarks from photos with LaMa inpainting.
 
-A *profile* describes one known watermark: where its block sits, the mask
-silhouette, a presence detector and, optionally, fitted overlay maps. The
-built-in profile is the Avito listing logo. Without a profile a caller passes
-its own mask (a box or a PNG) and the same inpainting runs on it, with no
-presence check.
+Three ways to say where the mark is:
 
-Default method is LaMa inpainting of the mask. `method=unblend` inverts the
+* a *profile* — one known watermark at a fixed place (`profiles/<name>/`):
+  block position, mask silhouette, a presence detector and optional overlay
+  maps. `avito` is built in; `fit_profile.py` makes new ones from samples.
+* `auto` — a generic YOLO watermark detector (corzent/yolo11x_watermark_detection,
+  MIT) finds marks anywhere on the photo; each box, padded, is inpainted.
+  Slower and less exact than a profile, needs no setup.
+* a caller-supplied `mask_box` — exactly that rectangle, no detection.
+
+Default method is LaMa inpainting of the mask. `method=unblend` inverts a
 profile's fitted overlay `obs = (1-a)*orig + a*c` (`fit_alpha.py`) and hands
-only near-opaque pixels to LaMa; it is experimental, the maps fitted from
-JPEGs leave speckle, so it is never chosen automatically.
-
-Presence is decided per profile by a matched filter learned from samples
-(`fit_detector.py`): high-passed corner dotted with the mean difference
-between watermarked and cleaned corners. For Avito, on 219 photos the logo
-scores 300..2600 and clean corners -320..210.
+only near-opaque pixels to LaMa; it is experimental and never chosen
+automatically.
 
 HTTP API
   GET  /health
   GET  /v1/profiles
   POST /v1/clean                -> image/jpeg
        body: raw image bytes (Content-Type image/*) or multipart field `file`
-       query: profile=avito (default) | mask_box=x0,y0,x1,y1 (custom, no detector)
+       query: profile=avito (default) | profile=auto | mask_box=x0,y0,x1,y1
               mask=logo|rect (profile silhouette or its whole block)
               quality=1..100 (default 95), method=auto|lama|unblend (auto = lama)
        auth: Authorization: Bearer <CLEANER_TOKEN>; required unless CLEANER_ALLOW_ANON=1
        reply headers: X-Mask-Box, X-Watermark-Before, X-Watermark-After, X-Method
-       422 when the watermark is still detectable after cleaning
-       204 when no watermark is detected (image left unchanged)
+       422 when a profile watermark is still detectable after cleaning
+       204 when nothing is detected (image left unchanged)
 
 Only a window around the mask is processed and only the masked pixels are
 written back, so the rest of the photo changes only by the JPEG re-encode.
 """
 
+import hashlib
 import io
 import json
 import os
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,7 @@ from typing import Optional
 from PIL import Image, ImageFilter
 
 HERE = Path(__file__).resolve().parent
+PROFILES_DIR = HERE / "profiles"
 
 MASK_DILATE = 4
 # Context LaMa sees around the mask; enough for wood grain and tile lines.
@@ -56,27 +58,50 @@ MAX_BODY = 25 * 1024 * 1024
 LAMA_ALPHA_THRESHOLD = 0.6
 DETECTOR_PAD = 8
 
+# Generic detector: fine-tuned YOLO11x for watermarks and logos, MIT licence.
+YOLO_URL = "https://huggingface.co/corzent/yolo11x_watermark_detection/resolve/main/best.pt"
+YOLO_SHA256 = "6ac71b6ab8db27ec7928b5176e60a359c65e1579a5c1d58cf2f98df30cf3085e"
+YOLO_PATH = Path(os.environ.get("WATERMARKLESS_YOLO", HERE / "weights" / "yolo11x_watermark.pt"))
+YOLO_CONF = 0.25
+YOLO_IMGSZ = 1024
+# Detector boxes clip glyph edges by a few pixels; grow them before masking.
+AUTO_PAD = 10
+AUTO = "auto"
+
 
 @dataclass(frozen=True)
 class Profile:
-    """One known watermark."""
+    """One known watermark at a fixed offset from the bottom-right corner."""
 
     name: str
-    # Block size and its offset from the right and bottom edges, in pixels;
-    # the block is the same on every served variant of the profile's site.
     width: int
     height: int
     right: int
     bottom: int
-    template: Path
-    detector: Path
-    detector_meta: Path
-    k_map: Path
-    b_map: Path
-    # Matched-filter thresholds: present at or above `found`, clean at or
-    # below `clean` after processing.
+    directory: Path
     found: float
     clean: float
+    notes: str = ""
+
+    @property
+    def template(self) -> Path:
+        return self.directory / "mask.png"
+
+    @property
+    def detector(self) -> Path:
+        return self.directory / "detector.png"
+
+    @property
+    def detector_meta(self) -> Path:
+        return self.directory / "detector.json"
+
+    @property
+    def k_map(self) -> Path:
+        return self.directory / "k.png"
+
+    @property
+    def b_map(self) -> Path:
+        return self.directory / "b.png"
 
     def box(self, image_w: int, image_h: int) -> tuple:
         """Bounding box (x0, y0, x1, y1) of the watermark block on an image."""
@@ -84,40 +109,61 @@ class Profile:
         y1 = image_h - self.bottom
         return (max(0, x1 - self.width), max(0, y1 - self.height), x1, y1)
 
+    @classmethod
+    def load(cls, directory: Path) -> "Profile":
+        meta = json.loads((directory / "profile.json").read_text())
+        block = meta["block"]
+        thresholds = meta.get("thresholds", {})
+        return cls(
+            name=meta.get("name", directory.name),
+            width=int(block["width"]),
+            height=int(block["height"]),
+            right=int(block["right"]),
+            bottom=int(block["bottom"]),
+            directory=directory,
+            found=float(thresholds.get("present", 400)),
+            clean=float(thresholds.get("clean", 250)),
+            notes=meta.get("notes", ""),
+        )
 
-# Measured on 1280x854, 1280x960, 720x960 and 640x480: the Avito logo block is
-# 103x37 px, 6 px from the right edge and 5 px from the bottom, on all of them.
-# Inside it the glyphs are 94x24 at offset (3, 4): the official logo's alpha
-# silhouette fitted to the mean high-pass of 208 photos; logo_mask_1280.png is
-# that silhouette grown by 2 px for the shadow.
-AVITO = Profile(
-    name="avito",
-    width=103,
-    height=37,
-    right=6,
-    bottom=5,
-    template=HERE / "logo_mask_1280.png",
-    detector=HERE / "logo_detector.png",
-    detector_meta=HERE / "logo_detector.json",
-    k_map=HERE / "logo_k.png",
-    b_map=HERE / "logo_b.png",
-    found=400.0,
-    clean=250.0,
-)
-PROFILES = {AVITO.name: AVITO}
+    def save(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / "profile.json").write_text(
+            json.dumps(
+                {
+                    "name": self.name,
+                    "block": {"width": self.width, "height": self.height, "right": self.right, "bottom": self.bottom},
+                    "thresholds": {"present": self.found, "clean": self.clean},
+                    "notes": self.notes,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
-# Backwards-compatible names used by the fitting scripts and tests.
+
+def load_profiles(directory: Path = PROFILES_DIR) -> dict:
+    profiles = {}
+    if directory.is_dir():
+        for meta in sorted(directory.glob("*/profile.json")):
+            profile = Profile.load(meta.parent)
+            profiles[profile.name] = profile
+    return profiles
+
+
+PROFILES = load_profiles()
+AVITO = PROFILES["avito"]
+
+# Names the fitting scripts and tests use.
 LOGO_W, LOGO_H = AVITO.width, AVITO.height
 LOGO_RIGHT, LOGO_BOTTOM = AVITO.right, AVITO.bottom
 PRESENCE_FOUND, PRESENCE_CLEAN = AVITO.found, AVITO.clean
-TEMPLATE_PATH, K_PATH, B_PATH = AVITO.template, AVITO.k_map, AVITO.b_map
-DETECTOR_PATH, DETECTOR_META_PATH = AVITO.detector, AVITO.detector_meta
 
 
 def profile_named(name: Optional[str]) -> Profile:
     key = (name or AVITO.name).strip().lower()
     if key not in PROFILES:
-        raise ValueError(f"unknown profile '{name}': {', '.join(sorted(PROFILES))}")
+        raise ValueError(f"unknown profile '{name}': {', '.join(sorted(PROFILES))}, {AUTO}")
     return PROFILES[key]
 
 
@@ -149,15 +195,27 @@ def logo_mask(width: int, height: int, kind: str = "logo", profile: Profile = AV
     return dilate(mask)
 
 
-def box_mask(width: int, height: int, box: tuple) -> Image.Image:
-    """Custom rectangular mask from (x0, y0, x1, y1), clamped and dilated."""
+def box_mask(width: int, height: int, box: tuple, pad: int = 0) -> Image.Image:
+    """Rectangular mask from (x0, y0, x1, y1), padded, clamped and dilated."""
     x0, y0, x1, y1 = box
-    x0, y0 = max(0, int(x0)), max(0, int(y0))
-    x1, y1 = min(width, int(x1)), min(height, int(y1))
+    x0, y0 = max(0, int(x0) - pad), max(0, int(y0) - pad)
+    x1, y1 = min(width, int(x1) + pad), min(height, int(y1) + pad)
     if x1 <= x0 or y1 <= y0:
         raise ValueError("mask_box is empty or outside the image")
     mask = Image.new("L", (width, height), 0)
     mask.paste(255, (x0, y0, x1, y1))
+    return dilate(mask)
+
+
+def boxes_mask(width: int, height: int, boxes: list, pad: int = AUTO_PAD) -> Image.Image:
+    """Union of padded rectangles."""
+    mask = Image.new("L", (width, height), 0)
+    for box in boxes:
+        x0, y0, x1, y1 = box[:4]
+        x0, y0 = max(0, int(x0) - pad), max(0, int(y0) - pad)
+        x1, y1 = min(width, int(x1) + pad), min(height, int(y1) + pad)
+        if x1 > x0 and y1 > y0:
+            mask.paste(255, (x0, y0, x1, y1))
     return dilate(mask)
 
 
@@ -182,7 +240,7 @@ class Detector:
     sample. Scene texture is uncorrelated with the mark, so a present mark
     scores hundreds and a clean corner stays around zero."""
 
-    def __init__(self, profile: Profile = AVITO) -> None:
+    def __init__(self, profile: Profile) -> None:
         self.profile = profile
         self.available = profile.detector.exists() and profile.detector_meta.exists()
         if not self.available:
@@ -223,7 +281,7 @@ def _inv(v: int, k: int, b: int) -> int:
 class Unblender:
     """Inverts a profile's fitted overlay: orig = (obs - b) / k per channel."""
 
-    def __init__(self, profile: Profile = AVITO) -> None:
+    def __init__(self, profile: Profile) -> None:
         self.profile = profile
         self.available = profile.k_map.exists() and profile.b_map.exists()
         if self.available:
@@ -260,6 +318,47 @@ class Unblender:
         return result, dilate(mask, 1)
 
 
+def ensure_yolo_weights(path: Path = YOLO_PATH) -> Path:
+    """Downloads the generic detector once and checks its hash."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        urllib.request.urlretrieve(YOLO_URL, tmp)
+        tmp.replace(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != YOLO_SHA256:
+        raise RuntimeError(f"unexpected YOLO weights hash {digest} at {path}")
+    return path
+
+
+class AutoDetector:
+    """Generic watermark/logo boxes from the fine-tuned YOLO11x."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._model = None
+        self.available = YOLO_PATH.exists()
+
+    def _load(self):
+        with self._lock:
+            if self._model is None:
+                from ultralytics import YOLO
+
+                self._model = YOLO(str(ensure_yolo_weights()))
+                self.available = True
+        return self._model
+
+    def boxes(self, image: Image.Image, conf: float = YOLO_CONF) -> list:
+        """[(x0, y0, x1, y1, confidence)] in image pixels, highest first."""
+        result = self._load().predict(image.convert("RGB"), verbose=False, conf=conf, imgsz=YOLO_IMGSZ)[0]
+        found = []
+        if result.boxes is not None:
+            for box in result.boxes:
+                x0, y0, x1, y1 = (int(round(v)) for v in box.xyxy[0].tolist())
+                found.append((x0, y0, x1, y1, round(float(box.conf), 3)))
+        return sorted(found, key=lambda b: -b[4])
+
+
 class Cleaner:
     """Lazy LaMa wrapper; the model loads on the first request."""
 
@@ -269,6 +368,7 @@ class Cleaner:
         self.device = "unloaded"
         self.detectors = {name: Detector(p) for name, p in PROFILES.items()}
         self.unblenders = {name: Unblender(p) for name, p in PROFILES.items()}
+        self.auto = AutoDetector()
         self.requests = 0
         self.total_ms = 0.0
 
@@ -340,6 +440,15 @@ class Cleaner:
         self.total_ms += (time.time() - started) * 1000
         return result
 
+    def clean_auto(self, image: Image.Image) -> tuple:
+        """Detect marks anywhere with the generic detector and inpaint them.
+        Returns (cleaned image or None when nothing was found, boxes)."""
+        boxes = self.auto.boxes(image)
+        if not boxes:
+            return None, []
+        mask = boxes_mask(image.width, image.height, boxes)
+        return self.clean_mask(image, mask), boxes
+
 
 cleaner = Cleaner()
 detector = cleaner.detectors[AVITO.name]
@@ -357,13 +466,14 @@ def profile_info(profile: Profile) -> dict:
         "detector": cleaner.detectors[profile.name].available,
         "unblend": cleaner.unblenders[profile.name].available,
         "thresholds": {"present": profile.found, "clean": profile.clean},
+        "notes": profile.notes,
     }
 
 
 def build_app():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
-    app = FastAPI(title="watermarkless", version="0.3.0")
+    app = FastAPI(title="watermarkless", version="0.4.0")
     token = os.environ.get("CLEANER_TOKEN", "").strip()
     allow_anon = os.environ.get("CLEANER_ALLOW_ANON", "") == "1"
     if not token and not allow_anon:
@@ -380,16 +490,16 @@ def build_app():
             "model": "lama",
             "device": cleaner.device,
             "profiles": sorted(PROFILES),
-            "template": AVITO.template.exists(),
-            "unblend": cleaner.unblender.available,
+            "auto": cleaner.auto.available,
             "detector": detector.available,
+            "unblend": cleaner.unblender.available,
             "requests": cleaner.requests,
             "avgMs": round(cleaner.total_ms / cleaner.requests) if cleaner.requests else None,
         }
 
     @app.get("/v1/profiles")
     def profiles():
-        return {"profiles": [profile_info(p) for p in PROFILES.values()]}
+        return {"profiles": [profile_info(p) for p in PROFILES.values()], "auto": cleaner.auto.available}
 
     @app.post("/v1/clean")
     async def clean(
@@ -433,6 +543,11 @@ def build_app():
             except ValueError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
             headers = {"X-Mask-Box": ",".join(str(v) for v in custom.getbbox()), "X-Method": "lama"}
+        elif profile.strip().lower() == AUTO:
+            cleaned, boxes = cleaner.clean_auto(image)
+            if cleaned is None:
+                return Response(status_code=204, headers={"X-Method": "none"})
+            headers = {"X-Mask-Box": ";".join(",".join(str(v) for v in b[:4]) for b in boxes), "X-Method": "auto+lama"}
         else:
             try:
                 chosen = profile_named(profile)
@@ -456,20 +571,29 @@ def build_app():
 
 def main(argv: list) -> int:
     if len(argv) >= 3 and argv[1] == "clean":
-        # CLI check: app.py clean <input.jpg> [output.jpg] [auto|unblend|lama] [x0,y0,x1,y1]
+        # CLI check: app.py clean <input> [output] [profile|auto] [x0,y0,x1,y1]
         src = Path(argv[2])
         dst = Path(argv[3]) if len(argv) > 3 else src.with_name(src.stem + ".clean.jpg")
-        method = argv[4] if len(argv) > 4 else "auto"
+        which = argv[4] if len(argv) > 4 else AVITO.name
         image = Image.open(src).convert("RGB")
         if len(argv) > 5:
             cleaned = cleaner.clean_mask(image, box_mask(image.width, image.height, parse_mask_box(argv[5])))
             cleaned.save(dst, format="JPEG", quality=95, subsampling=0)
             print(f"{dst} method=lama mask_box={argv[5]} device={cleaner.device}")
             return 0
-        before = presence_score(image)
-        cleaned, used = cleaner.clean(image, "logo", method)
+        if which == AUTO:
+            cleaned, boxes = cleaner.clean_auto(image)
+            if cleaned is None:
+                print("nothing detected")
+                return 1
+            cleaned.save(dst, format="JPEG", quality=95, subsampling=0)
+            print(f"{dst} method=auto+lama boxes={boxes} device={cleaner.device}")
+            return 0
+        chosen = profile_named(which)
+        before = presence_score(image, chosen)
+        cleaned, used = cleaner.clean(image, "logo", "auto", chosen)
         cleaned.save(dst, format="JPEG", quality=95, subsampling=0)
-        print(f"{dst} method={used} device={cleaner.device} before={before} after={presence_score(cleaned)}")
+        print(f"{dst} profile={chosen.name} method={used} device={cleaner.device} before={before} after={presence_score(cleaned, chosen)}")
         return 0
     import uvicorn
 

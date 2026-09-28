@@ -1,7 +1,8 @@
 # watermarkless
 
-Removes watermarks from photos with LaMa inpainting; the Avito listing logo is
-the first built-in profile.
+Removes watermarks from photos with LaMa inpainting. Three ways to say where
+the mark is: a fitted *profile* for a known site (Avito is built in), `auto`
+with a generic YOLO watermark detector for any site, or an explicit box.
 Two front ends over the same code: an HTTP service (`app.py`, what Avito
 Manager calls from `watermark_cleaner.rs` when a download is asked to strip
 the watermark) and an MCP server (`mcp_server.py`) for agents working with
@@ -45,14 +46,16 @@ claude mcp add -s user watermarkless -- /path/to/repo/.venv/bin/python /path/to/
 Tools:
 
 - `cleaner_health()` — model, detector and device state.
-- `list_profiles()` — known watermarks with block geometry and thresholds.
+- `list_profiles()` — known watermarks with block geometry and thresholds, and whether `auto` is available.
+- `find_watermarks(path, confidence=0.25)` — generic detector boxes for any site.
 - `detect_watermark(path, profile="avito")` — presence score of one photo
   (avito: present ≥ 400, clean ≤ 250).
 - `clean_photo(path, output_path?, method="lama"|"unblend", quality=95,
   profile="avito", mask_box?)` — cleans one file into `<dir>/clean/<name>.jpg`
   unless `output_path` is given; answers `no_watermark` / `still_present`
-  instead of writing when the detector says so. With `mask_box=[x0,y0,x1,y1]`
-  (image pixels) exactly that area is inpainted, any site, no check.
+  instead of writing when the detector says so. `profile="auto"` finds marks of
+  any site with the generic detector. With `mask_box=[x0,y0,x1,y1]` (image
+  pixels) exactly that area is inpainted, no check.
 - `clean_folder(directory, method, quality, skip_existing=true, profile, mask_box?)`
   — every image in a folder, not recursive, `clean/` ignored; per-file statuses.
 
@@ -64,7 +67,7 @@ second), then ~0.3 s per photo on an Apple M3 Max CPU.
 - `GET /health` → `{"status":"ok","model":"lama","device":"cpu|cuda|unloaded","profiles":[...],"detector":true,"requests":N,"avgMs":M}`
 - `GET /v1/profiles` → known watermark profiles.
 - `POST /v1/clean` with the image as the raw body (or multipart `file`),
-  optional `?profile=avito&mask=logo|rect&quality=95&method=auto|lama|unblend`,
+  optional `?profile=avito|auto&mask=logo|rect&quality=95&method=auto|lama|unblend`,
   or `?mask_box=x0,y0,x1,y1` to inpaint a custom rectangle (any site, no
   presence check),
   `Authorization: Bearer <token>`. The token is required; set
@@ -75,15 +78,32 @@ second), then ~0.3 s per photo on an Apple M3 Max CPU.
   cleaning, `400` for non-images, `401` on a bad token, `413` above 25 MB or
   4096 px.
 
-## Profiles and custom masks
+## Profiles, auto mode and custom masks
 
-A profile is one known watermark: block position and size, mask silhouette,
-presence detector and optional overlay maps. `avito` is built in. A new
-profile needs 100–200 sample photos: fit the silhouette position, run
-`fit_detector.py`, add a `Profile` entry in `app.py`. Without a profile, pass
-`mask_box` and the same inpainting runs on that rectangle; automatic
-detection of unknown marks is out of scope (the community YOLO detectors
-tried here found only half of the real Avito logos).
+A **profile** is one known watermark at a fixed offset from the bottom-right
+corner: `profiles/<name>/profile.json` (block and thresholds), `mask.png`
+(silhouette), `detector.png` + `detector.json` (presence filter), optional
+`k.png`/`b.png` (overlay maps). `avito` is built in. Make a new one from
+40–200 sample photos of the site with one command:
+
+```bash
+.venv/bin/python fit_profile.py cian ~/photos/cian-listing-1 ~/photos/cian-listing-2
+```
+
+It locates the mark with the generic detector (or takes `--box x0,y0,x1,y1`),
+averages the high-passed block to get the silhouette, inpaints every sample
+to make negatives, fits the presence filter and picks thresholds from the
+score gap. Restart the service to load the profile.
+
+**`auto`** uses a fine-tuned YOLO11x watermark detector
+([corzent/yolo11x_watermark_detection](https://huggingface.co/corzent/yolo11x_watermark_detection),
+MIT, 114 MB, downloaded on first use into `weights/` and checked by SHA-256).
+Every box is padded by 10 px and inpainted. Measured on our photos: 66 of 70
+Avito logos found with correct boxes, 2 false boxes on 40 clean photos,
+~0.4 s per photo on CPU, and it found the Cian mark on a sample unseen by
+anyone. Use it for sites without a profile; a profile is exact and 10x faster.
+
+**`mask_box`** inpaints exactly the rectangle you pass, no detection.
 
 ## Method
 

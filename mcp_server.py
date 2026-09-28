@@ -25,8 +25,9 @@ server = FastMCP(
     instructions=(
         "Removes watermarks from photos on this machine. Known marks are profiles "
         "(list_profiles; 'avito' is built in): detect_watermark checks a photo, clean_photo "
-        "cleans one file, clean_folder a downloaded listing. For any other mark pass "
-        "mask_box=[x0,y0,x1,y1] in image pixels and the area is inpainted without a check. "
+        "cleans one file, clean_folder a downloaded listing. profile='auto' finds marks of "
+        "any site with a generic detector (find_watermarks shows the boxes); mask_box="
+        "[x0,y0,x1,y1] inpaints exactly that area without a check. "
         "Only process your own photos or photos you have permission to use."
     ),
 )
@@ -58,6 +59,14 @@ def _clean_one(source: Path, output: Optional[Path], method: str, quality: int, 
         target.parent.mkdir(parents=True, exist_ok=True)
         cleaned.save(target, format="JPEG", quality=quality, subsampling=0)
         return {"path": str(source), "status": "cleaned", "output": str(target), "method": "lama", "maskBox": list(mask_box), "ms": round((time.time() - started) * 1000)}
+    if profile.strip().lower() == app.AUTO:
+        cleaned, boxes = app.cleaner.clean_auto(image)
+        if cleaned is None:
+            return {"path": str(source), "status": "no_watermark", "profile": app.AUTO}
+        target = output or _default_output(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cleaned.save(target, format="JPEG", quality=quality, subsampling=0)
+        return {"path": str(source), "status": "cleaned", "profile": app.AUTO, "output": str(target), "method": "auto+lama", "boxes": [list(b) for b in boxes], "ms": round((time.time() - started) * 1000)}
     chosen = app.profile_named(profile)
     before = app.presence_score(image, chosen)
     if before is not None and before < chosen.found:
@@ -95,13 +104,23 @@ def cleaner_health() -> dict:
 
 @server.tool()
 def list_profiles() -> dict:
-    """Known watermark profiles with their block geometry, detector availability and thresholds."""
-    return {"profiles": [app.profile_info(p) for p in app.PROFILES.values()]}
+    """Known watermark profiles with their block geometry, detector availability and thresholds, plus whether the generic 'auto' detector is available."""
+    return {"profiles": [app.profile_info(p) for p in app.PROFILES.values()], "auto": app.cleaner.auto.available}
+
+
+@server.tool()
+def find_watermarks(path: str, confidence: float = 0.25) -> dict:
+    """Locate watermarks or logos of any site on a photo with the generic YOLO detector. Returns boxes [x0, y0, x1, y1, confidence] in image pixels; pass one to clean_photo as mask_box (add ~10 px) or just use profile='auto'."""
+    try:
+        boxes = app.cleaner.auto.boxes(_open(path), conf=confidence)
+    except ValueError as error:
+        return {"path": path, "status": "error", "error": str(error)}
+    return {"path": path, "boxes": [list(b) for b in boxes]}
 
 
 @server.tool()
 def detect_watermark(path: str, profile: str = "avito") -> dict:
-    """Score how strongly a photo carries the profile's watermark. For avito: present at or above 400, clean at or below 250."""
+    """Score how strongly a photo carries a profile's watermark (not for 'auto'; use find_watermarks). For avito: present at or above 400, clean at or below 250."""
     try:
         chosen = app.profile_named(profile)
         score = app.presence_score(_open(path), chosen)
@@ -125,7 +144,7 @@ def clean_photo(
     profile: str = "avito",
     mask_box: Optional[list] = None,
 ) -> dict:
-    """Remove a watermark from one photo. Writes <dir>/clean/<name>.jpg unless output_path is given. Uses the profile's mask and detector, or, with mask_box=[x0,y0,x1,y1] in pixels, inpaints exactly that area without a check. method: lama (default) or unblend (experimental, avito only)."""
+    """Remove a watermark from one photo. Writes <dir>/clean/<name>.jpg unless output_path is given. profile: a known mark (avito) with its mask and detector, or 'auto' to find marks of any site with the generic detector; mask_box=[x0,y0,x1,y1] in pixels inpaints exactly that area without a check. method: lama (default) or unblend (experimental, avito only)."""
     if method not in ("lama", "unblend"):
         raise ValueError("method must be lama or unblend")
     if not 1 <= quality <= 100:
@@ -146,10 +165,11 @@ def clean_folder(
     profile: str = "avito",
     mask_box: Optional[list] = None,
 ) -> dict:
-    """Remove a watermark from every photo in a folder (not recursive; a `clean` subfolder is ignored), by profile or by a shared mask_box. Returns per-file results."""
+    """Remove a watermark from every photo in a folder (not recursive; a `clean` subfolder is ignored), by profile ('auto' for any site) or by a shared mask_box. Returns per-file results."""
     if method not in ("lama", "unblend"):
         raise ValueError("method must be lama or unblend")
-    app.profile_named(profile)
+    if profile.strip().lower() != app.AUTO:
+        app.profile_named(profile)
     root = Path(directory).expanduser()
     if not root.is_dir():
         raise ValueError(f"no such directory: {root}")

@@ -2,7 +2,11 @@
 
 from PIL import Image
 
-from app import LOGO_BOTTOM, LOGO_H, LOGO_RIGHT, LOGO_W, PRESENCE_CLEAN, PRESENCE_FOUND, WINDOW_PAD, box_mask, logo_box, logo_mask, parse_mask_box, presence_score, profile_named, template, work_window
+import json
+from pathlib import Path
+import tempfile
+
+from app import AVITO, LOGO_BOTTOM, LOGO_H, LOGO_RIGHT, LOGO_W, PRESENCE_CLEAN, PRESENCE_FOUND, WINDOW_PAD, Profile, box_mask, boxes_mask, load_profiles, logo_box, logo_mask, parse_mask_box, presence_score, profile_named, template, work_window
 
 
 def test_box_is_fixed_size_in_the_corner():
@@ -75,6 +79,7 @@ def test_custom_box_mask_and_window():
 
 
 def test_profiles():
+    assert AVITO.directory.name == "avito" and AVITO.template.name == "mask.png"
     assert profile_named(None).name == "avito" and profile_named(" Avito ").name == "avito"
     try:
         profile_named("cian")
@@ -82,6 +87,18 @@ def test_profiles():
         assert "avito" in str(error)
     else:
         raise AssertionError("unknown profile accepted")
+
+
+def test_profile_roundtrip_and_auto_boxes():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Profile(name="demo", width=50, height=20, right=3, bottom=4, directory=Path(tmp) / "demo", found=123.0, clean=45.0, notes="x")
+        p.save()
+        loaded = load_profiles(Path(tmp))["demo"]
+        assert loaded == p
+        assert json.loads((Path(tmp) / "demo" / "profile.json").read_text())["block"]["right"] == 3
+    m = boxes_mask(400, 300, [(100, 100, 150, 120, 0.9), (380, 280, 420, 320, 0.5)], pad=10)
+    assert m.getbbox() == (86, 86, 400, 300)
+    assert m.getpixel((125, 110)) == 255 and m.getpixel((250, 200)) == 0
 
 
 if __name__ == "__main__":
@@ -92,4 +109,5 @@ if __name__ == "__main__":
     test_presence_score_separates_logo_from_clean_corner()
     test_custom_box_mask_and_window()
     test_profiles()
+    test_profile_roundtrip_and_auto_boxes()
     print("ok")
