@@ -80,20 +80,30 @@ second), then ~0.3 s per photo on an Apple M3 Max CPU.
 
 ## Profiles, auto mode and custom masks
 
-A **profile** is one known watermark at a fixed offset from the bottom-right
-corner: `profiles/<name>/profile.json` (block and thresholds), `mask.png`
-(silhouette), `detector.png` + `detector.json` (presence filter), optional
-`k.png`/`b.png` (overlay maps). `avito` is built in. Make a new one from
-40–200 sample photos of the site with one command:
+A **profile** is one known watermark near the bottom-right corner:
+`profiles/<name>/profile.json` (block geometry and thresholds), `mask.png`
+(silhouette or the whole block), optional `detector.png` + `detector.json`
+(presence filter) and `k.png`/`b.png` (overlay maps). The block geometry
+follows the photo size in one of three ways: fixed pixels (`avito`: 103x37
+at 6/5 px on every variant), everything scaled with the width (`scaled`), or
+a fixed-size block with margins proportional to width and height
+(`rightRatio`/`bottomRatio`; `cian`: ~205x90 px, 10.3% of the width from
+the right, 8.3% of the height from the bottom). Built in: `avito`, `cian`.
+Make a new one from 40–200 sample photos of the site with one command:
 
 ```bash
 .venv/bin/python fit_profile.py cian ~/photos/cian-listing-1 ~/photos/cian-listing-2
 ```
 
 It locates the mark with the generic detector (or takes `--box x0,y0,x1,y1`),
-averages the high-passed block to get the silhouette, inpaints every sample
-to make negatives, fits the presence filter and picks thresholds from the
-score gap. Restart the service to load the profile.
+picks the geometry model whose margins vary least across photo sizes,
+averages the high-passed block to get the silhouette (or masks the whole
+block when the mark has a variable part, such as Cian's listing ID),
+inpaints every sample to make negatives and fits a presence filter with
+thresholds from the score gap. When watermarked and clean scores overlap
+(Cian: the ID digits differ on every listing) no detector is written and the
+profile cleans every photo by its mask without the 204/422 gate. Restart the
+service to load the profile.
 
 **`auto`** uses a fine-tuned YOLO11x watermark detector
 ([corzent/yolo11x_watermark_detection](https://huggingface.co/corzent/yolo11x_watermark_detection),

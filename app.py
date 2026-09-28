@@ -71,7 +71,15 @@ AUTO = "auto"
 
 @dataclass(frozen=True)
 class Profile:
-    """One known watermark at a fixed offset from the bottom-right corner."""
+    """One known watermark at a fixed offset from the bottom-right corner.
+
+    `width`, `height`, `right`, `bottom` are pixels on a photo `ref_width`
+    wide. Two ways the geometry follows the photo size: `scaled` multiplies
+    everything by width/ref_width; `right_ratio`/`bottom_ratio` add a share
+    of the width/height to the margins while the block keeps its pixel size
+    (Cian: a ~205x90 px mark 10% of the width from the right and 8% of the
+    height from the bottom). Avito uses neither: the same 103x37 block sits
+    6/5 px from the corner on every variant."""
 
     name: str
     width: int
@@ -82,6 +90,10 @@ class Profile:
     found: float
     clean: float
     notes: str = ""
+    scaled: bool = False
+    ref_width: int = 1280
+    right_ratio: float = 0.0
+    bottom_ratio: float = 0.0
 
     @property
     def template(self) -> Path:
@@ -103,11 +115,20 @@ class Profile:
     def b_map(self) -> Path:
         return self.directory / "b.png"
 
+    def scale(self, image_w: int) -> float:
+        return image_w / self.ref_width if self.scaled else 1.0
+
+    def block_size(self, image_w: int) -> tuple:
+        k = self.scale(image_w)
+        return (max(1, round(self.width * k)), max(1, round(self.height * k)))
+
     def box(self, image_w: int, image_h: int) -> tuple:
         """Bounding box (x0, y0, x1, y1) of the watermark block on an image."""
-        x1 = image_w - self.right
-        y1 = image_h - self.bottom
-        return (max(0, x1 - self.width), max(0, y1 - self.height), x1, y1)
+        k = self.scale(image_w)
+        w, h = self.block_size(image_w)
+        x1 = image_w - round(self.right * k + self.right_ratio * image_w)
+        y1 = image_h - round(self.bottom * k + self.bottom_ratio * image_h)
+        return (max(0, x1 - w), max(0, y1 - h), x1, y1)
 
     @classmethod
     def load(cls, directory: Path) -> "Profile":
@@ -124,6 +145,10 @@ class Profile:
             found=float(thresholds.get("present", 400)),
             clean=float(thresholds.get("clean", 250)),
             notes=meta.get("notes", ""),
+            scaled=bool(block.get("scaled", False)),
+            ref_width=int(block.get("refWidth", 1280)),
+            right_ratio=float(block.get("rightRatio", 0.0)),
+            bottom_ratio=float(block.get("bottomRatio", 0.0)),
         )
 
     def save(self) -> None:
@@ -132,7 +157,7 @@ class Profile:
             json.dumps(
                 {
                     "name": self.name,
-                    "block": {"width": self.width, "height": self.height, "right": self.right, "bottom": self.bottom},
+                    "block": {"width": self.width, "height": self.height, "right": self.right, "bottom": self.bottom, "scaled": self.scaled, "refWidth": self.ref_width, "rightRatio": self.right_ratio, "bottomRatio": self.bottom_ratio},
                     "thresholds": {"present": self.found, "clean": self.clean},
                     "notes": self.notes,
                 },
@@ -234,11 +259,20 @@ def work_window(width: int, height: int, profile: Profile = AVITO, mask: Optiona
     return (max(0, x0 - WINDOW_PAD), max(0, y0 - WINDOW_PAD), min(width, x1 + WINDOW_PAD), min(height, y1 + WINDOW_PAD))
 
 
+def normalized(values: list) -> list:
+    """Zero-mean, unit-std copy, so contrast does not drive the score."""
+    n = len(values)
+    mean = sum(values) / n
+    std = (sum((v - mean) ** 2 for v in values) / n) ** 0.5 or 1.0
+    return [(v - mean) / std for v in values]
+
+
 class Detector:
-    """Matched filter for a profile: `score = <highpass(corner), w>` with `w`
-    the mean difference between watermarked and cleaned corners in the
-    sample. Scene texture is uncorrelated with the mark, so a present mark
-    scores hundreds and a clean corner stays around zero."""
+    """Matched filter for a profile: `score = <highpass(corner), w>`. For the
+    built-in Avito profile `w` is the mean difference between watermarked and
+    cleaned corners; profiles made by fit_profile.py use diagonal LDA weights
+    on contrast-normalised corners (`normalize` in detector.json), which
+    tolerates a variable part such as a listing ID inside the mark."""
 
     def __init__(self, profile: Profile) -> None:
         self.profile = profile
@@ -247,19 +281,27 @@ class Detector:
             return
         meta = json.loads(profile.detector_meta.read_text())
         self.pad = int(meta.get("pad", DETECTOR_PAD))
+        self.normalize = bool(meta.get("normalize", False))
+        self.gain = float(meta.get("gain", 1.0))
         scale = float(meta["scale"])
         img = Image.open(profile.detector).convert("L")
         self.size = img.size
         self.w = [(v - 128) * scale / 127.0 for v in img.getdata()]
 
     def highpass(self, image: Image.Image) -> Optional[list]:
-        x0, y0, x1, y1 = self.profile.box(image.width, image.height)
-        pad = self.pad
-        if (x1 - x0, y1 - y0) != (self.profile.width, self.profile.height) or x0 < pad or y0 < pad:
+        p = self.profile
+        x0, y0, x1, y1 = p.box(image.width, image.height)
+        if (x1 - x0, y1 - y0) != p.block_size(image.width):
+            return None
+        k = p.scale(image.width)
+        pad = max(1, round(self.pad * k))
+        if x0 < pad or y0 < pad:
             return None
         gray = image.convert("L").crop((x0 - pad, y0 - pad, x1 + pad, y1 + pad))
         if gray.size != self.size:
-            return None
+            # Scaled profile on another width: bring the block to the
+            # reference size so the filter lines up.
+            gray = gray.resize(self.size, Image.BILINEAR)
         blurred = gray.filter(ImageFilter.GaussianBlur(6))
         return [a - b for a, b in zip(gray.getdata(), blurred.getdata())]
 
@@ -269,7 +311,9 @@ class Detector:
         hp = self.highpass(image)
         if hp is None:
             return None
-        return sum(a * b for a, b in zip(hp, self.w))
+        if self.normalize:
+            hp = normalized(hp)
+        return sum(a * b for a, b in zip(hp, self.w)) * self.gain
 
 
 def _inv(v: int, k: int, b: int) -> int:
@@ -462,7 +506,7 @@ def presence_score(image: Image.Image, profile: Profile = AVITO) -> Optional[flo
 def profile_info(profile: Profile) -> dict:
     return {
         "name": profile.name,
-        "block": {"width": profile.width, "height": profile.height, "right": profile.right, "bottom": profile.bottom},
+        "block": {"width": profile.width, "height": profile.height, "right": profile.right, "bottom": profile.bottom, "scaled": profile.scaled, "refWidth": profile.ref_width, "rightRatio": profile.right_ratio, "bottomRatio": profile.bottom_ratio},
         "detector": cleaner.detectors[profile.name].available,
         "unblend": cleaner.unblenders[profile.name].available,
         "thresholds": {"present": profile.found, "clean": profile.clean},

@@ -82,7 +82,7 @@ def test_profiles():
     assert AVITO.directory.name == "avito" and AVITO.template.name == "mask.png"
     assert profile_named(None).name == "avito" and profile_named(" Avito ").name == "avito"
     try:
-        profile_named("cian")
+        profile_named("no-such-site")
     except ValueError as error:
         assert "avito" in str(error)
     else:
@@ -91,11 +91,17 @@ def test_profiles():
 
 def test_profile_roundtrip_and_auto_boxes():
     with tempfile.TemporaryDirectory() as tmp:
-        p = Profile(name="demo", width=50, height=20, right=3, bottom=4, directory=Path(tmp) / "demo", found=123.0, clean=45.0, notes="x")
+        p = Profile(name="demo", width=50, height=20, right=3, bottom=4, directory=Path(tmp) / "demo", found=123.0, clean=45.0, notes="x", scaled=True, ref_width=1000)
         p.save()
         loaded = load_profiles(Path(tmp))["demo"]
         assert loaded == p
         assert json.loads((Path(tmp) / "demo" / "profile.json").read_text())["block"]["right"] == 3
+        # scaled: on a 500-wide photo everything halves; fixed: pixels stay
+        assert loaded.box(500, 400) == (500 - 2 - 25, 400 - 2 - 10, 498, 398)
+        assert Profile(**{**p.__dict__, "scaled": False}).box(500, 400) == (447, 376, 497, 396)
+        # ratio margins: 10% of the width and 8% of the height, block fixed
+        r = Profile(**{**p.__dict__, "scaled": False, "right": 0, "bottom": 0, "right_ratio": 0.1, "bottom_ratio": 0.08})
+        assert r.box(1000, 500) == (1000 - 100 - 50, 500 - 40 - 20, 900, 460)
     m = boxes_mask(400, 300, [(100, 100, 150, 120, 0.9), (380, 280, 420, 320, 0.5)], pad=10)
     assert m.getbbox() == (86, 86, 400, 300)
     assert m.getpixel((125, 110)) == 255 and m.getpixel((250, 200)) == 0

@@ -1,0 +1,18 @@
+{
+  "name": "cian",
+  "block": {
+    "width": 223,
+    "height": 102,
+    "right": -10,
+    "bottom": -10,
+    "scaled": false,
+    "refWidth": 1280,
+    "rightRatio": 0.1034,
+    "bottomRatio": 0.0828
+  },
+  "thresholds": {
+    "present": 400.0,
+    "clean": 250.0
+  },
+  "notes": "fitted from 130 photos; no presence detector (scores overlapped)"
+}
